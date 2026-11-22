@@ -4,8 +4,12 @@ compatibility_date = "2023-09-04"
 main = "index.js"
 
 # ================= 多桶模式 =================
-# 整段 JSON 作为 secret，不写进这个文件：
-#   wrangler secret put BUCKETS_CONFIG < buckets.json
+# 整段 JSON 作为 Secret，不写进这个文件的 [vars]。
+# 方式一（网页，推荐）：Dashboard → Settings → Variables and Secrets → Add
+#   类型 Secret / 变量名 BUCKETS_CONFIG / Value 原样粘贴带缩进的多行 JSON → Deploy
+#   ★ 不用压成单行，JSON 允许换行与缩进
+# 方式二（CLI）：jq -c . buckets.json | npx wrangler secret put BUCKETS_CONFIG
+#   ★ 只有走 CLI 管道时才建议压单行，避免终端/管道只取第一行
 # 格式见 buckets.json.example
 #
 # 路由键：path = URL 第一段当别名（推荐，workers.dev 也能用）
@@ -23,9 +27,23 @@ RCLONE_DOWNLOAD = "false"
 #    "x-amz-content-sha256", "x-amz-date"
 #]
 
-# ================= 兼容模式（不设 BUCKETS_CONFIG 时生效）=================
-# 不配 BUCKETS_CONFIG 就完全退回原版单桶行为，此时打开下面四项：
+# ============ ⚠️ 二选一，必须配齐其一，否则访问任何路径都会 500 /__diag 会显示「未配置」============
+#
+# 【A. 多桶模式】什么都不用在这里打开，只需设 Secret：
+#   Dashboard：Add → 类型 Secret → 变量名 BUCKETS_CONFIG → 原样粘贴多行 JSON → Deploy
+#   CLI（可选）：jq -c . buckets.json | npx wrangler secret put BUCKETS_CONFIG
+#   ⚠️ 变量名是 BUCKETS_CONFIG，不是 CONFIG / BUCKETS / B2_CONFIG
+#   访问 /<别名>/<文件路径>，例如 /one/4.jpg
+#
+# 【B. 单桶兼容模式】不设 BUCKETS_CONFIG 时，必须把下面三项【全部取消注释】：
 #B2_APPLICATION_KEY_ID = "<key id>"
 #B2_ENDPOINT = "https://s3.us-east-005.backblazeb2.com"
 #BUCKET_NAME = "$path"
-# 并用 wrangler secret put B2_APPLICATION_KEY 设置密钥
+# 并设 Secret：npx wrangler secret put B2_APPLICATION_KEY
+#
+# ⚠️ B2_ENDPOINT 必须带 https:// —— 按仓库模板注释写成不带协议的
+#    "s3.us-west-001.backblazeb2.com" 会让原版 new URL() 抛 Error 1101。
+#    本改造版两种都吃，但为了和原版一致，建议一律带协议。
+#
+# 配置自查：部署后访问 https://你的域名/__diag （不显示任何密钥）
+# ========================================================================================

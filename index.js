@@ -66,11 +66,34 @@ function normalizeEndpoint(endpoint) {
     return s.split('/')[0];
 }
 
-// 从 secret 读取多桶表（整段 JSON），未配置则返回 null → 走原版单桶路径
+// 网页 Dashboard 粘贴时常见的多余字符清洗（仅在严格解析失败后兜底，不影响正常路径）
+function sanitizeBucketJson(raw) {
+    let s = String(raw).replace(/^\uFEFF/, '').trim();       // BOM + 首尾空白
+    s = s.replace(/^```(?:json)?\s*/i, '').replace(/\s*```$/, '').trim();  // Markdown 代码围栏
+    s = s.replace(/,\s*$/, '').trim();                      // 整段末尾孤立的逗号
+    s = s.replace(/,(\s*[}\]])/g, '$1');                    // 对象/数组内部末尾多余逗号
+    return s;
+}
+
+// 从 Secret 读取多桶表（整段 JSON），未配置则返回 null → 走原版单桶路径
+// JSON 标准允许任意空白/换行，所以 Dashboard 里原样粘贴带缩进的多行 JSON 完全可用。
 function loadBuckets(env) {
     const raw = env['BUCKETS_CONFIG'];
     if (!raw) return null;
-    const parsed = typeof raw === 'string' ? JSON.parse(raw) : raw;
+    let parsed;
+    if (typeof raw !== 'string') {
+        parsed = raw;
+    } else {
+        try {
+            parsed = JSON.parse(raw);
+        } catch (e1) {
+            try {
+                parsed = JSON.parse(sanitizeBucketJson(raw));
+            } catch (e2) {
+                throw new Error(`${e1.message}（已自动尝试清洗 Markdown 围栏 / BOM / 尾逗号；请确认没有注释、多余逗号或从别处复制来的装饰字符）`);
+            }
+        }
+    }
     const out = {};
     for (const [alias, c] of Object.entries(parsed)) {
         const endpoint = normalizeEndpoint(c.endpoint);
@@ -88,6 +111,81 @@ function loadBuckets(env) {
     return out;
 }
 
+// 脱敏诊断：Cloudflare Dashboard 里看不到 Secret 的值，用这个页面确认它到底有没有生效
+function diagnosticText(env, buckets, parseError) {
+    const raw = env['BUCKETS_CONFIG'];
+    const rawStr = raw == null ? '' : String(raw);
+    const first = rawStr.replace(/^\uFEFF/, '').trimStart().slice(0, 1);
+    const shape = !rawStr ? '（空）'
+        : `${rawStr.length} 字符 / ${rawStr.includes('\n') ? '多行（Dashboard 粘贴正常）' : '单行'} / 首字符 "${first}"${first !== '{' ? ' ← 不是 {，可能粘进了围栏或注释' : ''}`;
+    const mode = parseError ? '❌ BUCKETS_CONFIG 解析失败'
+        : buckets ? '多桶 (BUCKETS_CONFIG)'
+        : (env['B2_ENDPOINT'] ? '单桶兼容' : '❌ 未配置');
+    const lines = [
+        'CF-Proxy-B2 多桶版 · 配置诊断（不显示任何密钥）',
+        '================================================',
+        `模式            : ${mode}`,
+        `BUCKET_SOURCE   : ${String(env['BUCKET_SOURCE'] || 'path')}`,
+        `配置形态        : ${shape}`,
+        `BUCKETS_CONFIG  : ${rawStr ? '已设置' : '未设置'}${parseError ? '（解析失败: ' + parseError + '）' : ''}`,
+        `B2_ENDPOINT     : ${env['B2_ENDPOINT'] ? '已设置' : '未设置'}`,
+        `B2_KEY_ID       : ${env['B2_APPLICATION_KEY_ID'] ? '已设置' : '未设置'}`,
+        `B2_APPLICATION_KEY : ${env['B2_APPLICATION_KEY'] ? '已设置(Secret)' : '未设置'}`,
+        `BUCKET_NAME     : ${env['BUCKET_NAME'] || '未设置'}`,
+        `ALLOW_LIST_BUCKET : ${env['ALLOW_LIST_BUCKET'] || '未设置'}`,
+        `RCLONE_DOWNLOAD : ${env['RCLONE_DOWNLOAD'] || '未设置'}`,
+        ''
+    ];
+    if (buckets) {
+        lines.push(`已加载别名 (${Object.keys(buckets).length}):`);
+        for (const c of Object.values(buckets)) {
+            lines.push(`  ${c.alias.padEnd(16)} -> ${c.bucket} @ ${c.endpoint} | key:${c.keyId ? '有' : '无'} | public:${c.isPublic}`);
+        }
+        lines.push('', '提示: 访问 /<别名>/<文件路径> ，例如 /one/4.jpg');
+    } else {
+        lines.push('没有加载任何别名。请二选一配置：',
+            '  A 多桶: Dashboard → Settings → Variables and Secrets → Add → 类型 Secret',
+            '          变量名 BUCKETS_CONFIG，Value 原样粘贴整段 JSON（带缩进的多行也可以）→ Deploy',
+            '          或 CLI: jq -c . buckets.json | npx wrangler secret put BUCKETS_CONFIG',
+            '  B 单桶: [vars] 里打开 B2_ENDPOINT / B2_APPLICATION_KEY_ID / BUCKET_NAME + Secret B2_APPLICATION_KEY',
+            '',
+            '  注意变量名是 BUCKETS_CONFIG，不是 CONFIG / BUCKETS / B2_CONFIG。');
+    }
+    return lines.join('\n');
+}
+
+function configHint(env) {
+    return [
+        'CF-Proxy-B2 多桶版：配置缺失，当前请求没有命中任何可用模式。',
+        '',
+        '【为什么看到这句】',
+        '  既没有有效的 BUCKETS_CONFIG（多桶模式），也没有 B2_ENDPOINT + BUCKET_NAME（单桶兼容模式）。',
+        '  注意：如果只覆盖了 wrangler.toml 而没设 Secret，就会卡在这里；',
+        '  如果 index.js 仍是仓库原版而 wrangler.toml 换成多桶版，原版 new URL(undefined) 会抛 Error 1101。',
+        '',
+        '【两种模式二选一，必须配齐其一】',
+        '',
+        'A. 多桶模式（推荐，可全程网页操作，不用指令）',
+        '   Dashboard → Workers & Pages → 你的 Worker → Settings → Variables and Secrets → Add',
+        '     类型  : Secret（加密），不要选 Plaintext / 不要加进 [vars]',
+        '     变量名: BUCKETS_CONFIG   ← 不是 CONFIG / BUCKETS / B2_CONFIG',
+        '     Value : 直接原样粘贴整段 JSON，带缩进的多行完全可以，不用压成单行',
+        '   然后 Save → Deploy（Secret 变更会生成新版本，不部署不生效）。',
+        '   CLI 等价写法（可选）：jq -c . buckets.json | npx wrangler secret put BUCKETS_CONFIG',
+        '   然后访问 /one/4.jpg（URL 首段是别名，不是真实桶名）。',
+        '',
+        'B. 单桶兼容模式',
+        '   在 wrangler.toml 的 [vars] 取消注释这三项：',
+        '     B2_ENDPOINT = "https://s3.us-east-005.backblazeb2.com"   ← 必须带 https://',
+        '     B2_APPLICATION_KEY_ID = "<key id>"',
+        '     BUCKET_NAME = "$path"',
+        '   并设 Secret：npx wrangler secret put B2_APPLICATION_KEY',
+        '',
+        '【自查】访问 /__diag 查看当前实际生效的模式与别名（不显示密钥）。',
+        '【常见 1101】端点按模板注释写成不带协议的 s3.us-west-001.backblazeb2.com，原版 new URL() 会抛错。'
+    ].join('\n');
+}
+
 export default {
     async fetch(request, env) {
         if (!['GET', 'HEAD'].includes(request.method)) {
@@ -102,11 +200,26 @@ export default {
         path = path.replace(/\/$/, '');
 
         // ---------- 多桶解析 ----------
-        let buckets;
+        let buckets = null;
+        let parseError = null;
         try {
             buckets = loadBuckets(env);
         } catch (e) {
-            return new Response('BUCKETS_CONFIG 配置错误: ' + e.message, { status: 500 });
+            parseError = e.message;
+        }
+
+        // 脱敏诊断页：直接访问 /__diag 就能确认 Secret 有没有生效
+        if (path === '__diag') {
+            return new Response(diagnosticText(env, buckets, parseError), {
+                headers: { 'Content-Type': 'text/plain;charset=utf-8', 'Cache-Control': 'no-store' },
+                status: 200
+            });
+        }
+        if (parseError) {
+            return new Response('BUCKETS_CONFIG 配置错误: ' + parseError + '\n\n访问 /__diag 查看详情。', {
+                headers: { 'Content-Type': 'text/plain;charset=utf-8', 'Cache-Control': 'no-store' },
+                status: 500
+            });
         }
 
         const source = String(env['BUCKET_SOURCE'] || 'path').toLowerCase(); // path | host
@@ -132,7 +245,13 @@ export default {
         }
 
         const b2Hostname = normalizeEndpoint(effectiveEnv['B2_ENDPOINT']);
-        if (!b2Hostname) return new Response('B2_ENDPOINT 未配置', { status: 500 });
+        // 兼容模式还必须有 BUCKET_NAME，否则 switch 会走 default 拼出 "undefined.xxx"
+        if (!b2Hostname || (!buckets && !effectiveEnv['BUCKET_NAME'])) {
+            return new Response(configHint(env), {
+                headers: { 'Content-Type': 'text/plain;charset=utf-8', 'Cache-Control': 'no-store' },
+                status: 500
+            });
+        }
 
         // ---------- 列桶保护 / 欢迎页 ----------
         if (isListBucketRequest(effectiveEnv, path) && String(effectiveEnv['ALLOW_LIST_BUCKET']) !== "true") {
