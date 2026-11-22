@@ -1,12 +1,31 @@
-name = "cloudflare-b2"
+name = "cf-proxy-b2-multi"
 workers_dev = true
 compatibility_date = "2023-09-04"
-
 main = "index.js"
 
+# ================= 多桶模式 =================
+# 整段 JSON 作为 secret，不写进这个文件：
+#   wrangler secret put BUCKETS_CONFIG < buckets.json
+# 格式见 buckets.json.example
+#
+# 路由键：path = URL 第一段当别名（推荐，workers.dev 也能用）
+#         host = 子域第一段当别名（必须给每个子域单独配 Route / Custom Domain）
 [vars]
-B2_APPLICATION_KEY_ID = "004d276434d8c0c0000000003"
-B2_ENDPOINT = "https://s3.us-west-004.backblazeb2.com"
-BUCKET_NAME = "pastegugugaga"
+BUCKET_SOURCE = "path"
 ALLOW_LIST_BUCKET = "false"
 RCLONE_DOWNLOAD = "false"
+
+# 可选：全局收紧参与签名的请求头（不设则透传除 UNSIGNABLE_HEADERS 外全部）
+# 若某桶需要单独覆盖，在 buckets.json 里给该别名加 "allowedHeaders": [...]
+#ALLOWED_HEADERS = [
+#    "content-type", "date", "host", "if-match", "if-modified-since",
+#    "if-none-match", "if-unmodified-since", "range",
+#    "x-amz-content-sha256", "x-amz-date"
+#]
+
+# ================= 兼容模式（不设 BUCKETS_CONFIG 时生效）=================
+# 不配 BUCKETS_CONFIG 就完全退回原版单桶行为，此时打开下面四项：
+#B2_APPLICATION_KEY_ID = "<key id>"
+#B2_ENDPOINT = "https://s3.us-east-005.backblazeb2.com"
+#BUCKET_NAME = "$path"
+# 并用 wrangler secret put B2_APPLICATION_KEY 设置密钥
